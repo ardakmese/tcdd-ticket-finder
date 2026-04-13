@@ -12,6 +12,7 @@ This project is a Python script that checks TCDD YHT ticket availability and sen
 
 - `tcdd_yht_monitor.py`: main script
 - `application.properties`: optional config file for the bearer token
+- `tcdd_yht_monitor_esp8266.ino`: ESP8266 sketch version
 
 ## Bearer Token
 

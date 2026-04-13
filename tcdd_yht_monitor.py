@@ -4,6 +4,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import socket
+import ssl
 import sys
 import time
 from dataclasses import dataclass
@@ -18,7 +20,11 @@ SEARCH_TRIP_URL = f"{BASE_URL}/tms/train/train-availability?environment=dev&user
 DEFAULT_INTERVAL_SECONDS = 30
 DEFAULT_TIMEZONE_OFFSET_HOURS = 3
 DEFAULT_MIN_TIME = "12:16"
-DEFAULT_NTFY_TOPIC_URL = "https://ntfy.sh/mytopic"
+DEFAULT_NTFY_TOPIC_URL = "https://ntfy.sh/tcdddeneme"
+DEFAULT_API_TIMEOUT_SECONDS = 30
+DEFAULT_NTFY_TIMEOUT_SECONDS = 15
+DEFAULT_RETRY_ATTEMPTS = 3
+DEFAULT_RETRY_DELAY_SECONDS = 5
 
 
 @dataclass(frozen=True)
@@ -142,7 +148,7 @@ def build_headers(bearer_token: str) -> dict[str, str]:
         "Content-Type": "application/json",
         "Origin": "https://ebilet.tcddtasimacilik.gov.tr",
         "DNT": "1",
-        "Connection": "keep-alive",
+        "Connection": "close",
         "Sec-Fetch-Dest": "empty",
         "Sec-Fetch-Mode": "cors",
         "Sec-Fetch-Site": "same-site",
@@ -173,21 +179,49 @@ def fetch_availability(
 ) -> dict[str, Any]:
     payload = build_payload(date_value, departure, arrival)
     body = json.dumps(payload).encode("utf-8")
-    req = request.Request(
-        SEARCH_TRIP_URL,
-        data=body,
-        headers=build_headers(bearer_token),
-        method="POST",
-    )
-    with request.urlopen(req, timeout=30) as response:
-        return json.loads(response.read().decode("utf-8"))
+    last_error: Exception | None = None
+
+    for attempt in range(1, DEFAULT_RETRY_ATTEMPTS + 1):
+        req = request.Request(
+            SEARCH_TRIP_URL,
+            data=body,
+            headers=build_headers(bearer_token),
+            method="POST",
+        )
+        try:
+            with request.urlopen(req, timeout=DEFAULT_API_TIMEOUT_SECONDS) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except error.HTTPError:
+            raise
+        except (error.URLError, TimeoutError, socket.timeout, ssl.SSLError) as exc:
+            last_error = exc
+            if attempt == DEFAULT_RETRY_ATTEMPTS or not is_transient_network_error(exc):
+                raise
+            time.sleep(DEFAULT_RETRY_DELAY_SECONDS)
+
+    assert last_error is not None
+    raise last_error
 
 
 def send_ntfy_notification(topic_url: str, message: str) -> None:
     body = message.encode("utf-8")
     req = request.Request(topic_url, data=body, method="POST")
-    with request.urlopen(req, timeout=15):
+    with request.urlopen(req, timeout=DEFAULT_NTFY_TIMEOUT_SECONDS):
         return
+
+
+def is_transient_network_error(exc: BaseException) -> bool:
+    if isinstance(exc, (TimeoutError, socket.timeout, ssl.SSLError)):
+        return True
+    if isinstance(exc, error.URLError):
+        return is_transient_network_error(exc.reason)
+    return "timed out" in str(exc).casefold()
+
+
+def format_network_error(exc: BaseException) -> str:
+    if isinstance(exc, error.URLError) and exc.reason:
+        return format_network_error(exc.reason)
+    return str(exc)
 
 
 def epoch_to_time(epoch_millis: int, timezone_offset: int) -> str:
@@ -308,7 +342,11 @@ def main() -> int:
                 found_message = (
                     f"Seat found for {args.departure} -> {args.arrival} on {args.date}. {line}"
                 )
-                send_ntfy_notification(args.ntfy_topic, found_message)
+                try:
+                    send_ntfy_notification(args.ntfy_topic, found_message)
+                except Exception as exc:  # noqa: BLE001
+                    print(f"Notification failed: {exc}", file=sys.stderr)
+                    continue
                 notified_alerts.add(line)
         except ValueError as exc:
             print(f"Configuration error: {exc}", file=sys.stderr)
@@ -317,9 +355,13 @@ def main() -> int:
             body = exc.read().decode("utf-8", errors="replace")
             print(f"HTTP error {exc.code}: {body}", file=sys.stderr)
             return 1
-        except error.URLError as exc:
-            print(f"Network error: {exc.reason}", file=sys.stderr)
-            return 1
+        except (error.URLError, TimeoutError, socket.timeout, ssl.SSLError) as exc:
+            print(
+                f"Network error: {format_network_error(exc)}. Retrying in {args.interval} seconds...",
+                file=sys.stderr,
+            )
+            if args.once:
+                return 1
         except Exception as exc:  # noqa: BLE001
             print(f"Unexpected error: {exc}", file=sys.stderr)
             return 1
